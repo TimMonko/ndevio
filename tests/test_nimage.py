@@ -6,6 +6,7 @@ from pathlib import Path
 from unittest import mock
 from unittest.mock import patch
 
+import numpy as np
 import pytest
 from bioio_base.exceptions import UnsupportedFileFormatError
 
@@ -1032,3 +1033,60 @@ def test_dask_chunks_are_per_plane(tmp_path: Path):
     )
     assert y_chunk == 64
     assert x_chunk == 64
+
+
+class TestSamplesDim:
+    """TIFFs whose Samples dim is not a plain (Y, X, 3) image (ndevio#73)."""
+
+    @staticmethod
+    def _layers(path: Path) -> list:
+        from napari.layers import Layer
+
+        # Creating the layers is the check: napari refuses axis labels,
+        # scale or units that do not match the data, and rgb data it
+        # cannot draw.
+        return [
+            Layer.create(*ldt) for ldt in nImage(path).get_layer_data_tuples()
+        ]
+
+    def test_stack_of_rgb_pages_is_one_rgb_layer(self, tmp_path: Path):
+        import tifffile
+
+        path = tmp_path / 'rgb_stack.tif'
+        tifffile.imwrite(
+            path, np.zeros((4, 16, 16, 3), 'uint8'), photometric='rgb'
+        )
+
+        img = nImage(path)
+        assert img.is_rgb
+        assert len(img.layer_axis_labels) == 3
+
+        (layer,) = self._layers(path)
+        assert layer.rgb
+        assert layer.ndim == 3
+        assert layer.data.shape == (4, 16, 16, 3)
+
+    def test_samples_that_are_not_rgb_open_as_a_stack(self, tmp_path: Path):
+        import tifffile
+
+        # Tagged as RGB with 5 samples per pixel, like a (C, Z, Y, X) stack
+        # saved with the wrong photometric tag.
+        path = tmp_path / 'not_rgb.tif'
+        tifffile.imwrite(
+            path,
+            np.zeros((3, 5, 16, 16), 'uint8'),
+            photometric='rgb',
+            planarconfig='separate',
+        )
+
+        img = nImage(path)
+        assert 'S' in img.dims.order
+        assert not img.is_rgb
+        assert img.layer_axis_labels == ('S', 'Y', 'X')
+        assert len(img.layer_names) == 3
+
+        layers = self._layers(path)
+        assert len(layers) == 3
+        for layer in layers:
+            assert not layer.rgb
+            assert layer.data.shape == (5, 16, 16)

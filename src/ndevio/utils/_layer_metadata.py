@@ -24,9 +24,11 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# Dimensions that are not exposed as napari layer axes (handled separately via
-# channel splitting / RGB handling).
-_EXCLUDED_DIMS = frozenset({'C', 'S'})
+# The dimension that is not a napari layer axis.  Channels are split into
+# separate layers; an RGB(A) layer instead keeps its channels as an axis and
+# hands its trailing Samples dim to napari as colour.
+_CHANNEL_DIM = 'C'
+_SAMPLES_DIM = 'S'
 
 # Exceptions raised by BioImage readers when physical metadata is missing or
 # stored in an old OME-Zarr format:
@@ -52,7 +54,7 @@ class LayerMetadata:
 
 
 def build_layer_metadata(
-    image: BioImage, dims: Sequence[str]
+    image: BioImage, dims: Sequence[str], *, rgb: bool = False
 ) -> LayerMetadata:
     """Resolve napari layer metadata from a BioImage.
 
@@ -62,7 +64,13 @@ def build_layer_metadata(
         The image to read physical metadata from (e.g. an ``nImage``).
     dims : Sequence[str]
         The squeezed dimension names of the layer data (e.g. from the
-        reference xarray).  Channel and Samples dims are excluded here.
+        reference xarray).
+    rgb : bool
+        Whether the layer is drawn as RGB(A).  If so the Samples dim is the
+        colour and every other dim is an axis, a Channel dim included (an
+        RGB layer is not split by channel).  Otherwise the Channel dim is
+        excluded, because each channel becomes its own layer, and a Samples
+        dim that is still present is an ordinary axis.
 
     Returns
     -------
@@ -71,7 +79,8 @@ def build_layer_metadata(
         metadata that cannot be read falls back to ``scale=1.0`` / ``units=None``
         rather than raising.
     """
-    axis_labels = tuple(str(d) for d in dims if d not in _EXCLUDED_DIMS)
+    excluded = _SAMPLES_DIM if rgb else _CHANNEL_DIM
+    axis_labels = tuple(str(d) for d in dims if d != excluded)
     return LayerMetadata(
         axis_labels=axis_labels,
         scale=_resolve_scale(image, axis_labels),

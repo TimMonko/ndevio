@@ -24,6 +24,10 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+SAMPLES_DIM = 'S'
+# Sample counts napari can draw as one RGB(A) layer.
+RGB_SIZES = (3, 4)
+
 
 class nImage(BioImage):
     """
@@ -221,11 +225,13 @@ class nImage(BioImage):
             current_res = self.current_resolution_level
             self.set_resolution_level(0)
             try:
-                self._reference_xarray = (
-                    self.xarray_dask_data
-                    if self._use_dask
-                    else self.xarray_data
-                ).squeeze()
+                self._reference_xarray = _orient_samples(
+                    (
+                        self.xarray_dask_data
+                        if self._use_dask
+                        else self.xarray_data
+                    ).squeeze()
+                )
             finally:
                 self.set_resolution_level(current_res)
         return self._reference_xarray
@@ -273,10 +279,24 @@ class nImage(BioImage):
                     self.xarray_dask_data if use_dask else self.xarray_data
                 )
                 indexer = {d: 0 for d in xr_data.dims if d not in keep_dims}
-                arrays.append(xr_data.isel(indexer).data)
+                arrays.append(_orient_samples(xr_data.isel(indexer)).data)
         finally:
             self.set_resolution_level(current_res)
         return arrays
+
+    @property
+    def is_rgb(self) -> bool:
+        """True when the layer data ends in a Samples dim napari can draw.
+
+        A reader reporting a Samples (``S``) dim is not enough: napari only
+        draws 3 (RGB) or 4 (RGBA) samples.  TIFFs whose tags claim another
+        count (e.g. a ``(3, 35, Y, X)`` stack written as 35 samples per
+        pixel) are opened as ordinary stacks instead, with ``S`` moved in
+        front of ``Y`` and ``X`` so it becomes a slider.
+
+        """
+        ref = self.reference_xarray
+        return SAMPLES_DIM in ref.dims and ref.sizes[SAMPLES_DIM] in RGB_SIZES
 
     @property
     def path_stem(self) -> str:
@@ -338,7 +358,7 @@ class nImage(BioImage):
         base_name = delim.join(parts)
 
         # RGB (Samples dim): single layer, no channel prefix
-        if 'S' in self.dims.order:
+        if self.is_rgb:
             return [base_name]
 
         # Use BioImage channel_names — metadata only, no data load
@@ -361,7 +381,7 @@ class nImage(BioImage):
         """
         if self._layer_metadata is None:
             self._layer_metadata = build_layer_metadata(
-                self, self.reference_xarray.dims
+                self, self.reference_xarray.dims, rgb=self.is_rgb
             )
         return self._layer_metadata
 
@@ -507,8 +527,9 @@ class nImage(BioImage):
         axis_labels = layer_meta.axis_labels
         units = layer_meta.units
 
-        # Handle RGB images (Samples dimension 'S')
-        if 'S' in self.dims.order:
+        # RGB(A): one layer.  Any other dims, a C dim included (a stack of
+        # RGB pages is read as channels), stay as sliders.
+        if self.is_rgb:
             return [
                 build_layer_tuple(
                     data,
@@ -591,6 +612,24 @@ class nImage(BioImage):
             )
 
         return tuples
+
+
+def _orient_samples(data: xr.DataArray) -> xr.DataArray:
+    """Move a Samples dim that is not RGB(A) in front of the spatial dims.
+
+    Readers put ``S`` last, which is where napari wants RGB(A) samples.  A
+    Samples dim of any other size cannot be drawn as colour, so it is moved
+    ahead of ``Z``/``Y``/``X`` and treated as one more axis to slide through.
+    """
+    dims = list(data.dims)
+    if SAMPLES_DIM not in dims or data.sizes[SAMPLES_DIM] in RGB_SIZES:
+        return data
+    dims.remove(SAMPLES_DIM)
+    first_spatial = next(
+        (i for i, d in enumerate(dims) if d in ('Z', 'Y', 'X')), len(dims)
+    )
+    dims.insert(first_spatial, SAMPLES_DIM)
+    return data.transpose(*dims)
 
 
 def _prepare_bioimage_init_kwargs(

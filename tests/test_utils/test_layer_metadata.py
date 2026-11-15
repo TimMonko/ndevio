@@ -14,8 +14,9 @@ import pytest
 
 from ndevio.utils._layer_metadata import LayerMetadata, build_layer_metadata
 
-# Squeezed dims may still include C (multichannel) and S (RGB); the translator
-# must exclude both from the exposed axis labels.
+# Squeezed dims may still include C (multichannel) and S (samples).  The
+# translator excludes C, because channels are split into layers, unless the
+# layer is RGB(A): then S is the colour and C stays an axis.
 DIMS = ('T', 'C', 'Z', 'Y', 'X')
 DIMS_WITH_SAMPLES = ('T', 'C', 'Z', 'Y', 'X', 'S')
 
@@ -107,9 +108,19 @@ class TestAxisLabels:
         meta = build_layer_metadata(image, DIMS)
         assert isinstance(meta, LayerMetadata)
 
-    def test_excludes_channel_and_samples(self, image):
-        meta = build_layer_metadata(image, DIMS_WITH_SAMPLES)
+    def test_excludes_channel(self, image):
+        meta = build_layer_metadata(image, DIMS)
         assert meta.axis_labels == ('T', 'Z', 'Y', 'X')
+
+    def test_rgb_excludes_samples_and_keeps_channel(self, image):
+        meta = build_layer_metadata(image, DIMS_WITH_SAMPLES, rgb=True)
+        assert meta.axis_labels == ('T', 'C', 'Z', 'Y', 'X')
+        assert len(meta.scale) == len(meta.units) == 5
+
+    def test_samples_that_are_not_rgb_stay_an_axis(self, image):
+        meta = build_layer_metadata(image, ('C', 'S', 'Y', 'X'))
+        assert meta.axis_labels == ('S', 'Y', 'X')
+        assert meta.scale == (1.0, 0.2, 0.2)
 
     def test_preserves_dims_order(self, image):
         meta = build_layer_metadata(image, ('Y', 'X'))

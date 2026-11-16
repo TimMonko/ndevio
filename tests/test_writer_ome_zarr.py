@@ -298,6 +298,31 @@ class TestNapariLayers:
         np.testing.assert_array_equal(np.asarray(new_labels.data), mask)
 
 
+def test_viewer_save_and_reopen(make_napari_viewer, tmp_path, stack, mask):
+    """Save from a viewer with napari's own save, open it again."""
+    viewer = make_napari_viewer()
+    viewer.add_image(
+        stack, name='DAPI', colormap='cyan', contrast_limits=(50, 1500)
+    )
+    painted = viewer.add_labels(mask, name='nuclei')
+
+    path = tmp_path / 'session.ome.zarr'
+    written = viewer.layers.save(str(path), plugin='ndevio')
+    assert written == [str(path)]
+
+    viewer.layers.clear()
+    viewer.open(str(path), plugin='ndevio')
+    assert [type(layer).__name__ for layer in viewer.layers] == [
+        'Image',
+        'Labels',
+    ]
+    image, labels = viewer.layers
+    assert image.colormap.name == 'cyan'
+    assert tuple(image.contrast_limits) == (50, 1500)
+    assert labels.name.startswith('nuclei')
+    np.testing.assert_array_equal(np.asarray(labels.data), painted.data)
+
+
 class TestFiles:
     def test_tiff_converts_with_names_and_scale(self, resources_dir, tmp_path):
         source = resources_dir / 'cells3d2ch_legacy.tiff'

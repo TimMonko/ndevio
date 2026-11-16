@@ -9,6 +9,9 @@ contributions:
     - id: ndevio.get_reader
       python_name: ndevio._napari_reader:napari_get_reader
       title: Open file with ndevio
+    - id: ndevio.write_ome_zarr
+      python_name: ndevio._writer_ome_zarr:write_layers_to_ome_zarr
+      title: Save image and labels layers as OME-Zarr
     - id: ndevio.make_plugin_installer_widget
       python_name: ndevio.widgets._plugin_install_widget:PluginInstallerWidget
       title: Install BioIO Reader Plugins
@@ -59,6 +62,11 @@ contributions:
         '*.txt', '*.v', '*.vms', '*.vsi', '*.vws', '*.wat', '*.wlz', '*.xdce', '*.xml', '*.xqd',
         '*.xqf', '*.xv', '*.xvthumb', '*.xys', '*.zarr', '*.zarr*', '*.zfp', '*.zfr', '*.zif', '*.zvi',
       ]
+  writers:
+    - command: ndevio.write_ome_zarr
+      layer_types: ['image*', 'labels*']
+      filename_extensions: ['.ome.zarr', '.zarr']
+      display_name: OME-Zarr (image and labels)
   configurations:
     reader:
       title: Reader

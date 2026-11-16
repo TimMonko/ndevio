@@ -27,10 +27,6 @@ LABELS_GROUP = 'labels'
 
 _HEX_COLOUR = re.compile(r'^#?([0-9a-fA-F]{6})$')
 
-# The window bioio-ome-zarr's writer fills in when it is given no channels.
-# It says nothing about the data, and for anything but uint8 it is wrong.
-_WRITER_DEFAULT_WINDOW = (0.0, 255.0)
-
 
 def ngff_attrs(attrs: Mapping[str, Any] | None) -> Mapping[str, Any]:
     """Return the NGFF metadata of a group's attributes.
@@ -89,20 +85,57 @@ def _one_channel(channel: Any) -> dict[str, Any]:
     if match:
         out['colormap'] = '#' + match.group(1).lower()
 
-    window = channel.get('window')
-    if isinstance(window, Mapping):
-        try:
-            limits = (float(window['start']), float(window['end']))
-        except (KeyError, TypeError, ValueError):
-            limits = None
-        usable = limits and limits[0] < limits[1]
-        if usable and limits != _WRITER_DEFAULT_WINDOW:
-            out['contrast_limits'] = limits
+    limits = _window_limits(channel.get('window'))
+    if limits is not None:
+        out['contrast_limits'] = limits
 
     active = channel.get('active')
     if isinstance(active, bool):
         out['visible'] = active
     return out
+
+
+def _window_limits(window: Any) -> tuple[float, float] | None:
+    """``(start, end)`` of an OMERO window, if it narrows the range.
+
+    A window whose start and end span its whole ``min``-``max`` chose
+    nothing (writers fill it in with the dtype range, or bioio-ome-zarr's
+    0-255 default), so it gives None and napari picks contrast limits from
+    the data.
+    """
+    if not isinstance(window, Mapping):
+        return None
+    try:
+        start, end = float(window['start']), float(window['end'])
+    except (KeyError, TypeError, ValueError):
+        return None
+    if not start < end:
+        return None
+    try:
+        low, high = float(window['min']), float(window['max'])
+    except (KeyError, TypeError, ValueError):
+        return start, end
+    if start <= low and end >= high:
+        return None
+    return start, end
+
+
+def channel_layer_types(attrs: Mapping[str, Any] | None) -> tuple[str, ...]:
+    """Layer types ndevio recorded for the root image's channels.
+
+    NGFF has no way to say "these channels are labels" when there is no
+    image to put a ``labels/`` group under, so ndevio's writer records it
+    in an ``ndevio`` attribute.  Anything else gives an empty tuple.
+    """
+    if not isinstance(attrs, Mapping):
+        return ()
+    ours = attrs.get('ndevio')
+    types = ours.get('layer_types') if isinstance(ours, Mapping) else None
+    if not isinstance(types, list) or not all(
+        t in ('image', 'labels') for t in types
+    ):
+        return ()
+    return tuple(types)
 
 
 @dataclass
@@ -266,6 +299,7 @@ __all__ = [
     'LABELS_GROUP',
     'LabelImage',
     'channel_display',
+    'channel_layer_types',
     'ngff_attrs',
     'read_labels',
 ]

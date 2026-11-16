@@ -54,6 +54,8 @@ class LayerMetadata:
     # Per-channel napari kwargs the file states (colormap, contrast_limits,
     # visible), indexed like the C dim.  Empty when the file says nothing.
     channel_display: tuple[dict, ...] = ()
+    # Per-channel layer types the file records ('image' / 'labels'), or ().
+    channel_layer_types: tuple[str, ...] = ()
 
 
 def build_layer_metadata(
@@ -90,22 +92,34 @@ def build_layer_metadata(
         units=_resolve_units(image, axis_labels),
         metadata=_resolve_metadata(image),
         channel_display=() if rgb else _resolve_channel_display(image),
+        channel_layer_types=() if rgb else _resolve_channel_types(image),
     )
 
 
-def _resolve_channel_display(image: BioImage) -> tuple[dict, ...]:
-    """Read OMERO channel display hints, for readers whose metadata has them.
+def _zarr_attrs(image: BioImage) -> dict | None:
+    """The root group attributes, for readers whose metadata is a zarr group.
 
-    Only OME-Zarr exposes them today: its reader's ``metadata`` is the zarr
-    group's metadata, whose ``attributes`` hold the NGFF ``omero`` block.
+    Only OME-Zarr today: its reader's ``metadata`` is the zarr group's
+    metadata, whose ``attributes`` hold the NGFF blocks.
     """
+    try:
+        return getattr(image.metadata, 'attributes', None)
+    except _METADATA_UNAVAILABLE:
+        return None
+
+
+def _resolve_channel_display(image: BioImage) -> tuple[dict, ...]:
+    """Read OMERO channel display hints, if the file has them."""
     from ._ome_zarr import channel_display
 
-    try:
-        attrs = getattr(image.metadata, 'attributes', None)
-    except _METADATA_UNAVAILABLE:
-        return ()
-    return channel_display(attrs)
+    return channel_display(_zarr_attrs(image))
+
+
+def _resolve_channel_types(image: BioImage) -> tuple[str, ...]:
+    """Read the layer types ndevio's writer recorded, if any."""
+    from ._ome_zarr import channel_layer_types
+
+    return channel_layer_types(_zarr_attrs(image))
 
 
 def _resolve_scale(

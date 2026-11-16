@@ -560,6 +560,11 @@ class nImage(BioImage):
             tuples.extend(self._label_layer_tuples())
         return tuples
 
+    def _recorded_layer_type(self, channel_idx: int) -> str | None:
+        """The layer type the file records for a channel, if it records one."""
+        types = self._resolved_metadata.channel_layer_types
+        return types[channel_idx] if channel_idx < len(types) else None
+
     def _channel_layer_kwargs(
         self,
         channel_idx: int,
@@ -652,6 +657,7 @@ class nImage(BioImage):
                 channel_types=channel_types,
                 channel_name=channel_name or '',
                 path_stem=self.path_stem,
+                recorded=self._recorded_layer_type(0),
             )
             extra_kwargs = self._channel_layer_kwargs(
                 0,
@@ -686,6 +692,7 @@ class nImage(BioImage):
                 channel_types=channel_types,
                 channel_name=channel_name,
                 path_stem=self.path_stem,
+                recorded=self._recorded_layer_type(i),
             )
 
             # Slice along channel axis for each resolution level

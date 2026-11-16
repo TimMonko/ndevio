@@ -48,15 +48,18 @@ def resolve_layer_type(
     channel_types: dict[str, str] | None = None,
     channel_name: str = '',
     path_stem: str | None = None,
+    recorded: str | None = None,
 ) -> str:
-    """Resolve layer type: global override > per-channel > auto-detect.
+    """Resolve layer type: global override > per-channel > file > guess.
 
     Resolution priority, from most general to most specific:
 
     1. ``global_override`` — applies the same type to every channel.
     2. ``channel_types`` — per-channel lookup by name.
-    3. ``channel_name`` keyword detection — checks for label-like keywords.
-    4. ``path_stem`` fallback — filename stem used when the channel name
+    3. ``recorded`` — the type the file itself records for this channel
+       (an OME-Zarr store written by ndevio).
+    4. ``channel_name`` keyword detection — checks for label-like keywords.
+    5. ``path_stem`` fallback — filename stem used when the channel name
        gives no signal (e.g. generic ``'0'`` from a file named
        ``cells_mask.tif``).
 
@@ -71,6 +74,8 @@ def resolve_layer_type(
     path_stem : str | None
         Filename stem (no extension) used as a fallback when the channel
         name does not contain label keywords.
+    recorded : str | None
+        The layer type the file records for this channel, if any.
 
     Returns
     -------
@@ -82,6 +87,8 @@ def resolve_layer_type(
         return global_override
     if channel_types and channel_name in channel_types:
         return channel_types[channel_name]
+    if recorded is not None:
+        return recorded
     if _contains_label_keyword(channel_name, CHANNEL_LABEL_KEYWORDS):
         return 'labels'
     if path_stem and _contains_label_keyword(path_stem, FILE_LABEL_KEYWORDS):

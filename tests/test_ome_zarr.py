@@ -150,6 +150,21 @@ class TestChannelDisplay:
             {'omero': {'channels': 'nonsense'}},
             {'omero': {'channels': [{'color': 'not-a-colour'}]}},
             {'omero': {'channels': [{'window': {'start': 5, 'end': 5}}]}},
+            # A window over its whole range chose nothing.
+            {
+                'omero': {
+                    'channels': [
+                        {
+                            'window': {
+                                'min': 0,
+                                'max': 65535,
+                                'start': 0,
+                                'end': 65535,
+                            }
+                        }
+                    ]
+                }
+            },
         ],
     )
     def test_missing_or_malformed_gives_nothing_to_override(self, attrs):

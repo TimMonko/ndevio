@@ -51,6 +51,9 @@ class LayerMetadata:
     scale: tuple[float, ...]
     units: tuple[str | None, ...]
     metadata: dict
+    # Per-channel napari kwargs the file states (colormap, contrast_limits,
+    # visible), indexed like the C dim.  Empty when the file says nothing.
+    channel_display: tuple[dict, ...] = ()
 
 
 def build_layer_metadata(
@@ -86,7 +89,23 @@ def build_layer_metadata(
         scale=_resolve_scale(image, axis_labels),
         units=_resolve_units(image, axis_labels),
         metadata=_resolve_metadata(image),
+        channel_display=() if rgb else _resolve_channel_display(image),
     )
+
+
+def _resolve_channel_display(image: BioImage) -> tuple[dict, ...]:
+    """Read OMERO channel display hints, for readers whose metadata has them.
+
+    Only OME-Zarr exposes them today: its reader's ``metadata`` is the zarr
+    group's metadata, whose ``attributes`` hold the NGFF ``omero`` block.
+    """
+    from ._ome_zarr import channel_display
+
+    try:
+        attrs = getattr(image.metadata, 'attributes', None)
+    except _METADATA_UNAVAILABLE:
+        return ()
+    return channel_display(attrs)
 
 
 def _resolve_scale(

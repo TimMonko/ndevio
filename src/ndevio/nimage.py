@@ -326,6 +326,39 @@ class nImage(BioImage):
         return Path(self.path).stem
 
     @property
+    def _layer_channel_names(self) -> list[str]:
+        """One name per channel, even when the reader gives too few.
+
+        ``BioImage.channel_names`` reads metadata only (no data load), but
+        some readers return a list that does not match the C dim (an
+        OME-Zarr store with no ``omero`` block gives one name for any number
+        of channels).  Missing names become the channel index.
+        """
+        names = list(self.channel_names or [])
+        n_channels = self.dims.C
+        if len(names) != n_channels:
+            if names:
+                logger.debug(
+                    'Reader gave %d channel names for %d channels; '
+                    'using indices for the rest.',
+                    len(names),
+                    n_channels,
+                )
+            names = names[:n_channels] + [
+                str(i) for i in range(len(names), n_channels)
+            ]
+        return names
+
+    @property
+    def _base_layer_name(self) -> str:
+        """The scene-qualified path stem every layer name ends with."""
+        parts: list[str] = []
+        if len(self.scenes) > 1 or self.current_scene != 'Image:0':
+            parts.extend([str(self.current_scene_index), self.current_scene])
+        parts.append(self.path_stem)
+        return ' :: '.join(parts)
+
+    @property
     def layer_names(self) -> list[str]:
         """Per-channel layer names for napari.
 
@@ -349,20 +382,13 @@ class nImage(BioImage):
         ['0 :: cells.ome']
 
         """
-        # Build scene-qualified base name
-        delim = ' :: '
-        parts: list[str] = []
-        if len(self.scenes) > 1 or self.current_scene != 'Image:0':
-            parts.extend([str(self.current_scene_index), self.current_scene])
-        parts.append(self.path_stem)
-        base_name = delim.join(parts)
+        base_name = self._base_layer_name
 
         # RGB (Samples dim): single layer, no channel prefix
         if self.is_rgb:
             return [base_name]
 
-        # Use BioImage channel_names — metadata only, no data load
-        channel_names = self.channel_names
+        channel_names = self._layer_channel_names
 
         # Single channel (C=1 is squeezed out of layer_data)
         if self.dims.C == 1:
@@ -467,12 +493,19 @@ class nImage(BioImage):
         layer_type: str | None = None,
         channel_types: dict[str, str] | None = None,
         channel_kwargs: dict[str, dict] | None = None,
+        *,
+        include_labels: bool = True,
     ) -> list[LayerDataTuple]:
         """Build layer data tuples for napari.
 
         Splits multichannel data into separate layers, each with appropriate
         metadata. Automatically detects label layers from channel names
         containing keywords like 'label', 'mask', 'segmentation'.
+
+        For OME-Zarr, each channel takes the colour, contrast limits and
+        visibility the store's ``omero`` block gives it, and every label
+        image in the store's ``labels/`` group is added after the channels
+        as a Labels layer.
 
         Parameters
         ----------
@@ -488,7 +521,11 @@ class nImage(BioImage):
         channel_kwargs : dict[str, dict], optional
             Per-channel napari kwargs overrides.
             e.g., {"DAPI": {"colormap": "blue", "contrast_limits": (0, 1000)}}
-            These override the automatically generated metadata.
+            These override the automatically generated metadata and the
+            file's own display hints.
+        include_labels : bool
+            Whether to add the label images of an OME-Zarr store's
+            ``labels/`` group.  Default True.
 
         Returns
         -------
@@ -516,6 +553,68 @@ class nImage(BioImage):
         https://napari.org/dev/plugins/building_a_plugin/guides.html
 
         """
+        tuples = self._channel_layer_tuples(
+            layer_type, channel_types, channel_kwargs
+        )
+        if include_labels:
+            tuples.extend(self._label_layer_tuples())
+        return tuples
+
+    def _channel_layer_kwargs(
+        self,
+        channel_idx: int,
+        layer_type: str,
+        override: dict | None,
+    ) -> dict | None:
+        """The file's display hints for a channel, under the caller's."""
+        display = self._resolved_metadata.channel_display
+        hints = (
+            display[channel_idx]
+            if layer_type == 'image' and channel_idx < len(display)
+            else {}
+        )
+        merged = {**hints, **(override or {})}
+        return merged or None
+
+    def _label_layer_tuples(self) -> list[LayerDataTuple]:
+        """Labels layers for the image-labels of an OME-Zarr store."""
+        if self.path is None or not type(self.reader).__module__.startswith(
+            'bioio_ome_zarr'
+        ):
+            return []
+        from .utils._ome_zarr import read_labels
+
+        base_name = self._base_layer_name
+        tuples: list[LayerDataTuple] = []
+        for label in read_labels(self.path):
+            extra: dict = {}
+            if label.colors:
+                extra['colormap'] = {
+                    None: (0.5, 0.5, 0.5, 1.0),
+                    0: (0.0, 0.0, 0.0, 0.0),
+                    **label.colors,
+                }
+            tuples.append(
+                build_layer_tuple(
+                    label.levels if len(label.levels) > 1 else label.levels[0],
+                    layer_type='labels',
+                    name=f'{label.name} :: {base_name}',
+                    metadata=self.layer_metadata,
+                    scale=label.scale,
+                    axis_labels=label.axis_labels,
+                    units=label.units,
+                    extra_kwargs=extra or None,
+                )
+            )
+        return tuples
+
+    def _channel_layer_tuples(
+        self,
+        layer_type: str | None,
+        channel_types: dict[str, str] | None,
+        channel_kwargs: dict[str, dict] | None,
+    ) -> list[LayerDataTuple]:
+        """One layer per channel (or one RGB layer) of the current scene."""
         ref = self.reference_xarray
         data = self.layer_data
         if layer_type is not None:
@@ -547,17 +646,19 @@ class nImage(BioImage):
 
         # Single channel (no C dimension to split)
         if channel_dim not in ref.dims:
-            channel_name = self.channel_names[0]
+            channel_name = self._layer_channel_names[0]
             effective_type = resolve_layer_type(
                 global_override=layer_type,
                 channel_types=channel_types,
                 channel_name=channel_name or '',
                 path_stem=self.path_stem,
             )
-            extra_kwargs = (
+            extra_kwargs = self._channel_layer_kwargs(
+                0,
+                effective_type,
                 channel_kwargs.get(channel_name)
                 if channel_kwargs and channel_name
-                else None
+                else None,
             )
             return [
                 build_layer_tuple(
@@ -573,7 +674,7 @@ class nImage(BioImage):
             ]
 
         # Multichannel - split into separate layers
-        channel_names = self.channel_names
+        channel_names = self._layer_channel_names
         channel_axis = ref.dims.index(channel_dim)
         total_channels = ref.shape[channel_axis]
 
@@ -592,8 +693,10 @@ class nImage(BioImage):
             slices[channel_axis] = i
             channel_data = [arr[tuple(slices)] for arr in data]
 
-            extra_kwargs = (
-                channel_kwargs.get(channel_name) if channel_kwargs else None
+            extra_kwargs = self._channel_layer_kwargs(
+                i,
+                effective_type,
+                channel_kwargs.get(channel_name) if channel_kwargs else None,
             )
 
             tuples.append(

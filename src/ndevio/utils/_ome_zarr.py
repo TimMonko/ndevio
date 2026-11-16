@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import logging
 import re
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -218,7 +218,7 @@ def _read_label(labels: Any, name: str) -> LabelImage:
         index = tuple(
             slice(None) if i in keep else 0 for i in range(len(axes))
         )
-        levels = [_LazyIndex(level, index) for level in levels]
+        levels = [LazyView(level, index) for level in levels]
         axis_labels = tuple(axis_labels[i] for i in keep)
         scale = tuple(scale[i] for i in keep)
         units = tuple(units[i] for i in keep)
@@ -261,28 +261,74 @@ def _label_colors(
     return colors
 
 
-class _LazyIndex:
-    """An array view that applies a fixed integer index on access.
+class LazyView:
+    """A view of an array with some axes fixed at an index, read on access.
 
-    Holds "channel 0 of this zarr array" without reading it.  napari needs
-    ``shape``, ``dtype``, ``ndim`` and ``__getitem__``.
+    Holds "channel 2 of this ``zarr.Array``, without its size-1 ``t``
+    axis" without reading anything, which is what napari needs from layer
+    data: ``shape``, ``dtype``, ``ndim`` and ``__getitem__``.  Indexing
+    returns what the underlying array returns (numpy, for zarr).
+
+    Parameters
+    ----------
+    array : array-like
+        Anything with ``shape``, ``dtype`` and numpy-style ``__getitem__``.
+    index : tuple of int or slice(None), optional
+        One entry per axis of *array*: an int fixes that axis (it is not
+        part of the view), ``slice(None)`` keeps it.  Default: keep all.
+
     """
 
-    def __init__(self, array: Any, index: tuple[int | slice, ...]) -> None:
+    def __init__(
+        self, array: Any, index: tuple[int | slice, ...] | None = None
+    ) -> None:
+        if index is None:
+            index = (slice(None),) * len(array.shape)
+        if len(index) != len(array.shape):
+            raise ValueError(
+                f'index has {len(index)} entries for {len(array.shape)} axes'
+            )
         self._array = array
-        self._index = index
+        self._index = tuple(index)
         self._kept = [i for i, ix in enumerate(index) if isinstance(ix, slice)]
         self.dtype = array.dtype
-        self.shape = tuple(array.shape[i] for i in self._kept)
+        self.shape = tuple(int(array.shape[i]) for i in self._kept)
         self.ndim = len(self.shape)
+
+    @property
+    def size(self) -> int:
+        """Number of elements, without reading them."""
+        n = 1
+        for s in self.shape:
+            n *= s
+        return n
+
+    @property
+    def nbytes(self) -> int:
+        """Bytes the view would take in memory, without reading it."""
+        return self.size * self.dtype.itemsize
+
+    def take(self, axis: int, i: int) -> LazyView:
+        """The view with one more axis fixed at *i*, still unread."""
+        if not -self.ndim <= axis < self.ndim:
+            raise IndexError(f'axis {axis} out of range for {self.ndim} dims')
+        if not -self.shape[axis] <= i < self.shape[axis]:
+            raise IndexError(f'index {i} out of range for axis {axis}')
+        index = list(self._index)
+        index[self._kept[axis]] = i % self.shape[axis]
+        return LazyView(self._array, tuple(index))
 
     def __getitem__(self, key: Any) -> Any:
         if not isinstance(key, tuple):
             key = (key,)
-        if Ellipsis in key:
-            at = key.index(Ellipsis)
+        at = next((n for n, k in enumerate(key) if k is Ellipsis), None)
+        if at is not None:
             fill = (slice(None),) * (self.ndim - len(key) + 1)
             key = key[:at] + fill + key[at + 1 :]
+        if len(key) > self.ndim:
+            raise IndexError(
+                f'too many indices: {len(key)} for {self.ndim} dims'
+            )
         key = key + (slice(None),) * (self.ndim - len(key))
         full = list(self._index)
         for axis, k in zip(self._kept, key, strict=True):
@@ -294,12 +340,91 @@ class _LazyIndex:
 
         return np.asarray(self[...], dtype=dtype)
 
+    def __len__(self) -> int:
+        return self.shape[0]
+
+    def __repr__(self) -> str:
+        return (
+            f'LazyView(shape={self.shape}, dtype={self.dtype}, '
+            f'of {type(self._array).__name__})'
+        )
+
+
+def take_channel(array: Any, axis: int, i: int) -> Any:
+    """Channel *i* along *axis*, without reading it if *array* is lazy.
+
+    A :class:`LazyView` stays a view.  Anything else (numpy, dask) is
+    indexed as before: numpy reads it, dask stays lazy by itself.
+    """
+    if isinstance(array, LazyView):
+        return array.take(axis, i)
+    index: list[int | slice] = [slice(None)] * array.ndim
+    index[axis] = i
+    return array[tuple(index)]
+
+
+def level_views(store: Any, dims: Sequence[str]) -> list[LazyView] | None:
+    """The store's resolution levels as views with exactly *dims*.
+
+    Parameters
+    ----------
+    store : str, Path or zarr store
+        The image's root.
+    dims : sequence of str
+        The dims the layer data must have, in order (``nImage``'s
+        squeezed reference dims, e.g. ``('C', 'Z', 'Y', 'X')``).
+
+    Returns
+    -------
+    list of LazyView or None
+        One view per dataset, level 0 first.  None when the store cannot
+        give *dims* by dropping size-1 axes alone (a transposed store, an
+        axis *dims* names that the store lacks, more than one multiscale):
+        the caller then keeps its own (dask) path.
+
+    """
+    import zarr
+
+    try:
+        root = zarr.open_group(store, mode='r')
+    except (FileNotFoundError, ValueError):
+        return None
+    multiscales = ngff_attrs(root.attrs.asdict()).get('multiscales')
+    if not isinstance(multiscales, list) or len(multiscales) != 1:
+        return None
+    try:
+        names = [_axis_name(ax).upper() for ax in multiscales[0]['axes']]
+        paths = [d['path'] for d in multiscales[0]['datasets']]
+    except (KeyError, TypeError):
+        return None
+    if [n for n in names if n in dims] != list(dims):
+        return None
+
+    views: list[LazyView] = []
+    for path in paths:
+        array = root[path]
+        if len(array.shape) != len(names):
+            return None
+        index: list[int | slice] = []
+        for name, size in zip(names, array.shape, strict=True):
+            if name in dims:
+                index.append(slice(None))
+            elif size == 1:
+                index.append(0)
+            else:
+                return None
+        views.append(LazyView(array, tuple(index)))
+    return views
+
 
 __all__ = [
     'LABELS_GROUP',
     'LabelImage',
+    'LazyView',
     'channel_display',
     'channel_layer_types',
+    'level_views',
     'ngff_attrs',
     'read_labels',
+    'take_channel',
 ]

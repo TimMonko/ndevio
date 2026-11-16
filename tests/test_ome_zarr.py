@@ -173,6 +173,136 @@ class TestChannelDisplay:
         assert all(d == {} for d in channel_display(attrs))
 
 
+class TestLazyView:
+    def test_drops_fixed_axes_and_reads_on_index(self):
+        from ndevio.utils._ome_zarr import LazyView
+
+        base = np.arange(2 * 3 * 4).reshape(1, 2, 3, 4)
+        view = LazyView(base, (0, slice(None), slice(None), slice(None)))
+        assert view.shape == (2, 3, 4)
+        assert view.ndim == 3
+        assert view.nbytes == base.nbytes
+        np.testing.assert_array_equal(view[1], base[0, 1])
+        np.testing.assert_array_equal(view[..., 2], base[0, :, :, 2])
+        np.testing.assert_array_equal(np.asarray(view), base[0])
+
+    def test_take_composes_without_reading(self):
+        from ndevio.utils._ome_zarr import LazyView
+
+        class Counting:
+            def __init__(self, a):
+                self.a, self.reads = a, 0
+                self.shape, self.dtype = a.shape, a.dtype
+
+            def __getitem__(self, key):
+                self.reads += 1
+                return self.a[key]
+
+        base = Counting(np.arange(24).reshape(2, 3, 4))
+        channel = LazyView(base).take(0, 1)
+        assert base.reads == 0
+        assert channel.shape == (3, 4)
+        np.testing.assert_array_equal(channel[2], base.a[1, 2])
+        assert base.reads == 1
+
+    def test_take_channel_leaves_numpy_and_dask_alone(self):
+        da = pytest.importorskip('dask.array')
+        from ndevio.utils._ome_zarr import take_channel
+
+        a = np.arange(24).reshape(2, 3, 4)
+        np.testing.assert_array_equal(take_channel(a, 0, 1), a[1])
+        lazy = take_channel(da.from_array(a), 1, 2)
+        assert isinstance(lazy, da.Array)
+        np.testing.assert_array_equal(lazy.compute(), a[:, 2])
+
+
+class TestLevelViews:
+    def test_store_levels_with_singletons_dropped(self, tmp_path):
+        from ndevio.utils._ome_zarr import level_views
+
+        path = tmp_path / 'a.ome.zarr'
+        data = _write_image(path)
+        views = level_views(str(path), ('C', 'Z', 'Y', 'X'))
+        assert [v.shape for v in views] == [(2, 4, 32, 32), (2, 4, 16, 16)]
+        np.testing.assert_array_equal(np.asarray(views[0]), data)
+
+    def test_a_transposed_store_gives_none(self, tmp_path):
+        from ndevio.utils._ome_zarr import level_views
+
+        path = tmp_path / 't.zarr'
+        root = zarr.open_group(str(path), mode='w')
+        root.create_array('0', data=np.zeros((8, 4, 2), dtype=np.uint8))
+        root.attrs['ome'] = {
+            'version': '0.5',
+            'multiscales': [
+                {
+                    'axes': [{'name': n} for n in ('x', 'y', 'c')],
+                    'datasets': [{'path': '0'}],
+                }
+            ],
+        }
+        assert level_views(str(path), ('C', 'Y', 'X')) is None
+
+    def test_not_a_store_gives_none(self, tmp_path):
+        from ndevio.utils._ome_zarr import level_views
+
+        assert level_views(str(tmp_path / 'missing.zarr'), ('Y', 'X')) is None
+
+
+# --- through nImage ---------------------------------------------------------
+
+
+class TestDaskFree:
+    """A multiscale OME-Zarr store gives napari zarr arrays, not dask."""
+
+    def test_channel_layers_are_unread_views(self, store):
+        from ndevio import nImage
+        from ndevio.utils._ome_zarr import LazyView
+
+        layers = nImage(store).get_layer_data_tuples()
+        for data, _, _ in layers:
+            assert all(isinstance(level, LazyView) for level in data)
+        assert [lvl.shape for lvl in layers[0][0]] == [
+            (4, 32, 32),
+            (4, 16, 16),
+        ]
+
+    def test_values_match_the_dask_path(self, store):
+        from ndevio import nImage
+
+        img = nImage(store)
+        views = img.get_layer_data_tuples()[1][0]
+        dask_level0 = img.xarray_dask_data.isel(T=0, C=1).data
+        np.testing.assert_array_equal(views[0][2], dask_level0[2].compute())
+
+    def test_napari_slices_the_views(self, store):
+        layers = pytest.importorskip('napari.layers')
+        from ndevio import nImage
+
+        data, kwargs, kind = nImage(store).get_layer_data_tuples()[0]
+        layer = layers.Layer.create(data, kwargs, kind)
+        assert layer.multiscale
+        plane = np.asarray(layer.data[0][1])
+        assert plane.shape == (32, 32)
+
+    def test_single_level_small_store_stays_in_memory(self, tmp_path):
+        from ndevio import nImage
+        from ndevio.utils._ome_zarr import LazyView
+
+        path = tmp_path / 'one.ome.zarr'
+        writers.OMEZarrWriter(
+            str(path),
+            level_shapes=[(2, 16, 16)],
+            dtype=np.uint8,
+            axes_names=['c', 'y', 'x'],
+            axes_types=['channel', 'space', 'space'],
+        ).write_full_volume(np.ones((2, 16, 16), dtype=np.uint8))
+        data = nImage(path).get_layer_data_tuples()[0][0]
+        level = data[0] if isinstance(data, list) else data
+        assert isinstance(level, np.ndarray)
+        assert not isinstance(level, LazyView)
+
+
 # --- through nImage ---------------------------------------------------------
 
 

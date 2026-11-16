@@ -15,6 +15,7 @@ from .utils._layer_utils import (
     build_layer_tuple,
     resolve_layer_type,
 )
+from .utils._ome_zarr import take_channel
 
 if TYPE_CHECKING:
     import xarray as xr
@@ -271,6 +272,11 @@ class nImage(BioImage):
         ref = self.reference_xarray
         keep_dims = set(ref.dims)
 
+        if use_dask:
+            views = self._zarr_level_views(tuple(str(d) for d in ref.dims))
+            if views is not None:
+                return views
+
         arrays: list = []
         try:
             for level in levels:
@@ -283,6 +289,33 @@ class nImage(BioImage):
         finally:
             self.set_resolution_level(current_res)
         return arrays
+
+    @property
+    def _is_ome_zarr(self) -> bool:
+        return type(self.reader).__module__.startswith('bioio_ome_zarr')
+
+    def _zarr_level_views(self, dims: tuple[str, ...]) -> list | None:
+        """An OME-Zarr store's own arrays, one per level, with no dask.
+
+        napari reads ``zarr.Array`` slices directly, so a dask graph over
+        each level adds a scheduler and nothing else.  Used for single-scene
+        OME-Zarr stores whose axes give *dims* by dropping size-1 axes;
+        anything else (several scenes, a transposed store, a Samples dim)
+        returns None and keeps bioio's dask path.
+        """
+        if (
+            self.path is None
+            or not self._is_ome_zarr
+            or len(self.scenes) != 1
+            or 'S' in dims
+        ):
+            return None
+        from .utils._ome_zarr import level_views
+
+        views = level_views(self.path, dims)
+        if views is None or len(views) != len(self.resolution_levels):
+            return None
+        return views
 
     @property
     def is_rgb(self) -> bool:
@@ -583,9 +616,7 @@ class nImage(BioImage):
 
     def _label_layer_tuples(self) -> list[LayerDataTuple]:
         """Labels layers for the image-labels of an OME-Zarr store."""
-        if self.path is None or not type(self.reader).__module__.startswith(
-            'bioio_ome_zarr'
-        ):
+        if self.path is None or not self._is_ome_zarr:
             return []
         from .utils._ome_zarr import read_labels
 
@@ -695,10 +726,8 @@ class nImage(BioImage):
                 recorded=self._recorded_layer_type(i),
             )
 
-            # Slice along channel axis for each resolution level
-            slices: list[slice | int] = [slice(None)] * ref.ndim
-            slices[channel_axis] = i
-            channel_data = [arr[tuple(slices)] for arr in data]
+            # Channel i of each resolution level, still unread.
+            channel_data = [take_channel(arr, channel_axis, i) for arr in data]
 
             extra_kwargs = self._channel_layer_kwargs(
                 i,
